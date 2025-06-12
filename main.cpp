@@ -2,6 +2,7 @@
 #define _UNICODE
 #include <windows.h>
 #include <gdiplus.h>
+#include <shlwapi.h>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <winevt.h>
 #include <mutex>
 #include <condition_variable>
+#include "resource.h"
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "user32.lib")
@@ -21,6 +23,8 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "wevtapi.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ole32.lib") // Add this line for CreateStreamOnHGlobal
 
 using namespace Gdiplus;
 
@@ -77,6 +81,7 @@ bool g_wasAboveThreshold = false;
 bool g_temporaryState = false;
 std::chrono::steady_clock::time_point g_temporaryStateStartTime;
 std::chrono::seconds g_temporaryStateDuration(2); // Show temporary states for 2 seconds
+HMODULE hInst = GetModuleHandle(NULL);
 
 // Synchronization for state changes
 std::mutex g_stateMutex;
@@ -98,7 +103,7 @@ double GetCPUUsage();
 double GetMemoryUsage();
 void CheckBatteryStatus();
 void ProcessWindowMessages();
-void LoadImages();
+void LoadImages(ULONG_PTR gdiplusToken); // Modified prototype
 void DrawCurrentState();
 void HandleDisplayChange();
 
@@ -134,16 +139,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     PdhCollectQueryData(cpuQuery);
 
     // Load images
-    LoadImages();
+    LoadImages(gdiplusToken); // Pass the token
     
-    // Load the application icon
-    // For LR_LOADFROMFILE with a path, hInst (first param) should be NULL.
-    // Ensure "img/icon.png" is in the correct path relative to your executable's
-    // working directory, or provide an absolute path.
-    HICON hAppIcon = (HICON)LoadImageW(NULL, L"img/icon.ico", IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+    // Load the application icon from resources.
+    // Assumes IDI_APP_ICON is an integer resource ID defined in resource.h,
+    // and the icon (e.g., "img/icon.ico") is compiled into the executable via an .rc file.
+    HICON hAppIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCE(IDI_APP_ICON), IMAGE_ICON, 
+                                      GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 
+                                      LR_DEFAULTCOLOR); // Load standard size icon from resources
+    HICON hAppIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCE(IDI_APP_ICON), IMAGE_ICON, 
+                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 
+                                       LR_DEFAULTCOLOR); // Load small size icon from resources
+
     if (!hAppIcon) {
         // Fallback to default application icon if custom one fails to load
-        hAppIcon = LoadIcon(NULL, IDI_APPLICATION); 
+        hAppIcon = LoadIconW(NULL, IDI_APPLICATION); 
+    }
+    if (!hAppIconSm) {
+        // Fallback for small icon, can use the large one or default
+        hAppIconSm = LoadIconW(NULL, IDI_APPLICATION); // Or use hAppIcon if it loaded
     }
 
     // Register window class
@@ -156,7 +170,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wcex.lpszClassName = WINDOW_CLASS_NAME;
     wcex.hIcon = hAppIcon; // Set the large icon
-    wcex.hIconSm = hAppIcon; // Set the small icon
+    wcex.hIconSm = hAppIconSm; // Set the small icon, was hAppIcon before
     RegisterClassExW(&wcex);
 
     // Create the window
@@ -246,34 +260,123 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     return (int)msg.wParam;
 }
 
-void LoadImages() {
+Gdiplus::Image* LoadGdiplusImageFromResource(int resourceId, const wchar_t* resourceType) {
+    HMODULE hModule = GetModuleHandle(NULL);
+    HRSRC hRes = FindResource(hModule, MAKEINTRESOURCE(resourceId), resourceType);
+    if (hRes == NULL) {
+        DWORD dwError = GetLastError(); // Get error code
+        OutputDebugStringW((L"Failed to find resource ID: " + std::to_wstring(resourceId) + 
+                            L" Type: " + (IS_INTRESOURCE(resourceType) ? std::to_wstring(reinterpret_cast<UINT_PTR>(resourceType)) : resourceType) +
+                            L" Error: " + std::to_wstring(dwError) + L"\n").c_str());
+        return nullptr;
+    }
+
+    DWORD dwSize = SizeofResource(hModule, hRes);
+    HGLOBAL hResLoad = LoadResource(hModule, hRes);
+    if (hResLoad == NULL) {
+        OutputDebugStringW((L"Failed to load resource ID: " + std::to_wstring(resourceId) + L"\n").c_str());
+        return nullptr;
+    }
+
+    void* pData = LockResource(hResLoad);
+    if (pData == NULL) {
+        OutputDebugStringW((L"Failed to lock resource ID: " + std::to_wstring(resourceId) + L"\n").c_str());
+        return nullptr;
+    }
+
+    // Allocate global memory and copy the resource data into it
+    HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, dwSize);
+    if (hGlobal)
+    {
+        void* pGlobalData = GlobalLock(hGlobal);
+        if (pGlobalData)
+        {
+            memcpy(pGlobalData, pData, dwSize);
+            GlobalUnlock(hGlobal);
+
+            // Create an IStream from the global memory
+            IStream* pStream = nullptr;
+            if (CreateStreamOnHGlobal(hGlobal, TRUE, &pStream) == S_OK)
+            {
+                // Gdiplus::Image takes ownership of the IStream
+                Gdiplus::Image* image = new Gdiplus::Image(pStream);
+                pStream->Release(); // Release our hold on it
+                
+                // Check if the image was created successfully from the stream
+                if (image->GetLastStatus() == Gdiplus::Ok)
+                {
+                    OutputDebugStringW((L"Successfully loaded image for resource ID: " + std::to_wstring(resourceId) + L"\n").c_str());
+                    return image;
+                }
+                else
+                {
+                    OutputDebugStringW((L"GDI+ failed to create image from stream for resource ID: " + std::to_wstring(resourceId) + L". Status: " + std::to_wstring(image->GetLastStatus()) + L"\n").c_str());
+                    delete image;
+                }
+            }
+            else
+            {
+                OutputDebugStringW((L"CreateStreamOnHGlobal failed for resource ID: " + std::to_wstring(resourceId) + L"\n").c_str());
+                GlobalFree(hGlobal); // Manually free if CreateStreamOnHGlobal failed
+            }
+        }
+        else
+        {
+            OutputDebugStringW((L"GlobalLock failed for resource ID: " + std::to_wstring(resourceId) + L"\n").c_str());
+            GlobalFree(hGlobal); // Manually free if GlobalLock failed
+        }
+        // If CreateStreamOnHGlobal succeeds, hGlobal is freed by the IStream's Release.
+    }
+    else {
+        OutputDebugStringW((L"GlobalAlloc failed for resource ID: " + std::to_wstring(resourceId) + L"\n").c_str());
+    }
+    
+    return nullptr;
+}
+
+void LoadImages(ULONG_PTR gdiplusToken) { // Modified signature
     // Load all the emotion images
-    g_images[HAPPY] = new Image(L"img/happy.png");
-    g_images[PLEASED] = new Image(L"img/pleased.png");
-    g_images[NEUTRAL] = new Image(L"img/neutral.png");
-    g_images[GRIMACE] = new Image(L"img/grimace.png");
-    g_images[GRIMACE_TWO_SWEAT] = new Image(L"img/grimace_two_sweat.png");
-    g_images[SURPRISED] = new Image(L"img/surprised.png");
-    g_images[ANGUISH] = new Image(L"img/anguish.png");
-    g_images[ANGUISH_VERY] = new Image(L"img/anguish_very.png");
-    g_images[ANGUISH_EXTREMELY] = new Image(L"img/anguish_extremely.png");
-    g_images[TIRED] = new Image(L"img/tired.png");
-    g_images[TIRED_VERY] = new Image(L"img/tired_very.png");
-    g_images[TIRED_EXTREMELY] = new Image(L"img/tired_extremely.png");
+    g_images[HAPPY] = LoadGdiplusImageFromResource(ID_IMAGE_HAPPY, RT_RCDATA);
+    g_images[PLEASED] = LoadGdiplusImageFromResource(ID_IMAGE_PLEASED, RT_RCDATA);
+    g_images[NEUTRAL] = LoadGdiplusImageFromResource(ID_IMAGE_NEUTRAL, RT_RCDATA);
+    g_images[GRIMACE] = LoadGdiplusImageFromResource(ID_IMAGE_GRIMACE, RT_RCDATA);
+    g_images[GRIMACE_TWO_SWEAT] = LoadGdiplusImageFromResource(ID_IMAGE_GRIMACE_TWO_SWEAT, RT_RCDATA);
+    g_images[SURPRISED] = LoadGdiplusImageFromResource(ID_IMAGE_SURPRISED, RT_RCDATA);
+    g_images[ANGUISH] = LoadGdiplusImageFromResource(ID_IMAGE_ANGUISH, RT_RCDATA);
+    g_images[ANGUISH_VERY] = LoadGdiplusImageFromResource(ID_IMAGE_ANGUISH_VERY, RT_RCDATA);
+    g_images[ANGUISH_EXTREMELY] = LoadGdiplusImageFromResource(ID_IMAGE_ANGUISH_EXTREMELY, RT_RCDATA);
+    g_images[TIRED] = LoadGdiplusImageFromResource(ID_IMAGE_TIRED, RT_RCDATA);
+    g_images[TIRED_VERY] = LoadGdiplusImageFromResource(ID_IMAGE_TIRED_VERY, RT_RCDATA);
+    g_images[TIRED_EXTREMELY] = LoadGdiplusImageFromResource(ID_IMAGE_TIRED_EXTREMELY, RT_RCDATA);
 
     // Load all the blink images
-    g_blinkImages[HAPPY] = new Image(L"img/happy_blink.png");
+    g_blinkImages[HAPPY] = LoadGdiplusImageFromResource(ID_IMAGE_HAPPY_BLINK, RT_RCDATA);
     g_blinkImages[PLEASED] = nullptr; // No blink for pleased
-    g_blinkImages[NEUTRAL] = new Image(L"img/neutral_blink.png");
+    g_blinkImages[NEUTRAL] = LoadGdiplusImageFromResource(ID_IMAGE_NEUTRAL_BLINK, RT_RCDATA);
     g_blinkImages[GRIMACE] = nullptr; // No blink for grimace
-    g_blinkImages[GRIMACE_TWO_SWEAT] = new Image(L"img/grimace_two_sweat_blink.png");
+    g_blinkImages[GRIMACE_TWO_SWEAT] = LoadGdiplusImageFromResource(ID_IMAGE_GRIMACE_TWO_SWEAT_BLINK, RT_RCDATA);
     g_blinkImages[SURPRISED] = nullptr; // No blink for surprised
-    g_blinkImages[ANGUISH] = new Image(L"img/anguish_blink.png");
-    g_blinkImages[ANGUISH_VERY] = new Image(L"img/anguish_very_blink.png");
+    g_blinkImages[ANGUISH] = LoadGdiplusImageFromResource(ID_IMAGE_ANGUISH_BLINK, RT_RCDATA);
+    g_blinkImages[ANGUISH_VERY] = LoadGdiplusImageFromResource(ID_IMAGE_ANGUISH_VERY_BLINK, RT_RCDATA);
     g_blinkImages[ANGUISH_EXTREMELY] = nullptr; // No blink for anguish_extremely
-    g_blinkImages[TIRED] = new Image(L"img/neutral_blink.png"); // Tired uses neutral_blink
-    g_blinkImages[TIRED_VERY] = new Image(L"img/tired_very_blink.png");
+    g_blinkImages[TIRED] = LoadGdiplusImageFromResource(ID_IMAGE_NEUTRAL_BLINK, RT_RCDATA); // Tired uses neutral_blink
+    g_blinkImages[TIRED_VERY] = LoadGdiplusImageFromResource(ID_IMAGE_TIRED_VERY_BLINK, RT_RCDATA);
     g_blinkImages[TIRED_EXTREMELY] = nullptr; // No blink for tired_extremely
+
+    // ULONG_PTR token_; // This local uninitialized token was incorrect
+    // Critical check for default image
+    if (!g_images[HAPPY] || g_images[HAPPY]->GetLastStatus() != Ok) {
+        MessageBoxW(NULL, L"Failed to load critical image resources (e.g., HAPPY state). The application cannot continue.", L"Resource Load Error", MB_ICONERROR | MB_OK);
+        // Post a quit message or exit directly if this is catastrophic
+        // For example, if called from WinMain before message loop, direct exit might be simpler.
+        // If in a thread or after message loop started, PostQuitMessage is better.
+        // Since this is in WinMain before the loop, we can consider exiting.
+        // For now, this message box will at least indicate the problem.
+        // To ensure termination if this happens before the message loop:
+        GdiplusShutdown(gdiplusToken); // Use the passed token
+        exit(1); // Or handle more gracefully
+    }
+
 
     // Set blink intervals (in seconds)
     for (int i = HAPPY; i <= TIRED_EXTREMELY; i++) {
@@ -683,12 +786,11 @@ void AddToSystemTray(HWND hwnd) {
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     
-    // Load an icon for the system tray
-    // For LR_LOADFROMFILE with a path, hInst (first param) should be NULL.
-    // Ensure "img/icon.png" is in the correct path.
-    HICON loadedIcon = (HICON)LoadImageW(NULL, L"img/icon.ico", IMAGE_ICON, 
+    // Load an icon for the system tray from resources.
+    // Assumes IDI_APP_ICON is an integer resource ID.
+    HICON loadedIcon = (HICON)LoadImageW(hInst, MAKEINTRESOURCE(IDI_APP_ICON), IMAGE_ICON, 
                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 
-                                  LR_LOADFROMFILE);
+                                  LR_DEFAULTCOLOR); // Explicitly use default color loading
     if (loadedIcon) {
         // If we previously loaded a custom icon, destroy it before replacing
         if (g_customTrayIcon) {
@@ -838,5 +940,5 @@ void PlaceWindowOnSecondaryMonitor(HWND hwnd) {
     
     // Set window position with proper flags to ensure it's correctly positioned
     SetWindowPos(hwnd, insertAfter, x, y, g_windowWidth, g_windowHeight, 
-                 SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+                 SWP_SHOWWINDOW | SWP_NOCOPYBITS);
 }
